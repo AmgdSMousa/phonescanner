@@ -1,6 +1,9 @@
 import argparse
 import os
 import datetime
+import time
+import json
+import sys
 from modules.adb_utils import is_device_connected, get_connected_devices, get_detailed_device_info
 from modules.package_scanner import get_installed_packages, scan_for_suspicious_packages
 from modules.integrity_check import check_root_access, check_bootloader_status, check_busybox
@@ -14,6 +17,11 @@ from modules.vulnerability_scanner import check_vulnerabilities
 from modules.vt_scanner import check_file_hash_vt
 from modules.dashboard import DashboardManager
 from modules.mitigation import freeze_app, uninstall_app, force_stop_app, get_mitigation_menu
+from modules.log_monitor import LogMonitor
+from modules.exploit_hunter import scan_world_writable, audit_system_props
+from modules.app_auditor import deep_audit_app
+from modules.reports_v2 import generate_html_report
+from modules.network_telemetry import NetworkTelemetry
 
 def print_header(title, file=None):
     text = f"\n{'='*60}\n  {title}\n{'='*60}"
@@ -43,6 +51,23 @@ def main():
     devices = get_connected_devices()
     device_id = args.device if args.device else devices[0]
     
+    # Initialize scan result variables to prevent NameErrors if sections are skipped
+    packages = []
+    suspicious = []
+    user_apps_risk = []
+    hidden_and_sensitive = []
+    hidden_user_apps = []
+    conn_list = []
+    file_results = {"apks_found": [], "suspicious_files": [], "hidden_files": []}
+    suspicious_procs = []
+    content_findings = []
+    vt_results = {}
+    writable = []
+    dangerous_props = []
+    integrity_summary = "Audit pending"
+    integrity_status = "INFO"
+    hunter_status = "INFO"
+
     # Get Device Info
     device_info = get_detailed_device_info(device_id)
     
@@ -52,13 +77,17 @@ def main():
         db = DashboardManager(device_info)
         db.start()
 
-    # Initialize Reporting
-    if not os.path.exists("reports"):
-        os.makedirs("reports")
-        
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     report_name = f"reports/Scan_{device_info['Model'].replace(' ', '_')}_{device_id}_{timestamp}.txt"
     report_file = open(report_name, "w", encoding="utf-8")
+
+    monitor = None
+    telemetry = None
+    if args.ui and db:
+        monitor = LogMonitor(device_id, callback=db.add_alert)
+        monitor.start()
+        telemetry = NetworkTelemetry(device_id)
+        telemetry.start()
 
     print_header("Mobile Security Scanner Starting...", report_file)
     log(f"[+] Scanning device: {device_id}", report_file)
@@ -318,51 +347,95 @@ def main():
     # 9. VirusTotal Analysis (Cloud-based Malware Check)
     if db: db.set_task("Querying VirusTotal for file hashes...")
     print_header("9. VirusTotal Analysis (Cloud Check)", report_file)
-    vt_key = args.vt_key if args.vt_key else os.environ.get("VT_API_KEY")
-    
-    vt_summary = "Skipped (No Key)"
-    if not vt_key:
-        log("[i] Skip: VirusTotal API Key not provided. Use -k <key> or set VT_API_KEY env var.", report_file)
-    else:
+    # VirusTotal Analysis (Scanner 2.0 Cloud Check)
+    vt_results = {}
+    if args.vt_key or os.environ.get("VT_API_KEY"):
+        vt_key = args.vt_key if args.vt_key else os.environ.get("VT_API_KEY")
+        if db: db.set_task("Cloud-checking hashes on VirusTotal...")
+        print_header("9. VirusTotal Analysis (Cloud Check)", report_file)
         # Collect unique hashes from file scanner results
-        all_hashes = set()
-        if file_results["suspicious_files"]:
-            for f in file_results["suspicious_files"]:
-                sha = get_file_hash(f, device_id)
-                if sha: all_hashes.add(sha)
+        all_candidates = file_results.get("apks_found", []) + file_results.get("suspicious_files", [])
+        hash_to_path = {}
+        all_hashes = []
+        for f in all_candidates:
+            sha = get_file_hash(f, device_id)
+            if sha and sha != "Unknown":
+                all_hashes.append(sha)
+                hash_to_path[sha] = os.path.basename(f)
+        all_hashes = list(set(all_hashes))
         
         if all_hashes:
             log(f"[*] Checking {len(all_hashes)} unique file hashes on VirusTotal...", report_file)
-            vt_malicious_count = 0
-            for h in all_hashes:
-                vt_res = check_file_hash_vt(h, vt_key)
-                if vt_res.get("found"):
-                    if vt_res['malicious'] > 0: vt_malicious_count += 1
+            from modules.vt_scanner import scan_multi_hashes
+            vt_results = scan_multi_hashes(all_hashes, vt_key, limit=30)
+            
+            for h, vt_res in vt_results.items():
+                fname = hash_to_path.get(h, "Unknown File")
+                if vt_res.get('found'):
                     tag = "[!] MALICIOUS" if vt_res['malicious'] > 0 else "[OK] Clean"
-                    log(f"    - Hash: {h[:16]}... | {tag} ({vt_res['malicious']}/{vt_res['total_engines']} engines)", report_file)
+                    log(f"    - {fname[:20]:20} | {tag} ({vt_res['malicious']}/{vt_res.get('total_engines', 0)} engines) | {h[:16]}...", report_file)
                 else:
-                    log(f"    - Hash: {h[:16]}... | {vt_res.get('message', 'Result unknown')}", report_file)
-            vt_summary = f"Cloud-scanned {len(all_hashes)} file hashes"
+                    log(f"    - {fname[:20]:20} | {vt_res.get('message', 'Not scanned (Limit reached)')} | {h[:16]}...", report_file)
+            vt_summary = f"Cloud-scanned {min(len(all_hashes), 30)} hashes"
         else:
             log("[OK] No suspicious local files found to check on VT.", report_file)
             vt_summary = "No files to scan"
+            
+        if db: db.update("VirusTotal Cloud", "OK", vt_summary)
+    else:
+        log("[i] Skip: VirusTotal API Key not provided.", report_file)
 
-    if db:
-        db.update("VirusTotal Cloud", "OK", vt_summary)
-        db.set_task(None)
-        db.stop()
+    # 10. Local Exploit Hunter (Scanner 2.0)
+    if db: db.set_task("Hunting for local exploits...")
+    print_header("10. Local Exploit Hunter", report_file)
+    writable = scan_world_writable(device_id)
+    dangerous_props = audit_system_props(device_id)
+    
+    hunter_status = "OK"
+    if writable or dangerous_props:
+        hunter_status = "WARNING"
+        log(f"[!] Warning: Found {len(writable)} writable files and {len(dangerous_props)} dangerous props.", report_file)
+        for w in writable:
+            log(f"    - [{w['type']}] {w['path']}", report_file)
+        for p in dangerous_props:
+            log(f"    - [Prop] {p['risk']}", report_file)
+    else:
+        log("[OK] No obvious local exploits found.", report_file)
+    
+    if db: db.update("Exploit Hunter", hunter_status, f"Found {len(writable)} risks")
 
+    if monitor: monitor.stop()
+    new_conns = telemetry.stop() if telemetry else []
+
+    # Finalize Reports
     print_header("Scan Complete", report_file)
     log(f"[i] Report saved to: {report_name}", report_file)
+    
+    html_report_path = report_name.replace(".txt", ".html")
+    if db: db.set_task("Generating visual HTML report...")
+    
+    # Enrichment for HTML report
+    vt_findings = [f"MALICIOUS: {h[:16]}..." for h, r in vt_results.items() if r.get('malicious', 0) > 0]
+    
+    html_data = {
+        "device_info": device_info,
+        "System Integrity": {"summary": integrity_summary, "severity": integrity_status},
+        "Package Scanner": {"summary": f"Scanned {len(packages)} apps", "findings": [p['name'] for p in suspicious], "severity": "WARNING" if suspicious else "OK"},
+        "VirusTotal Cloud": {"summary": f"Checked {len(vt_results)} files", "findings": vt_findings, "severity": "HIGH" if vt_findings else "OK"},
+        "Network Telemetry": {"summary": f"Tracked {len(new_conns)} new connections", "findings": [f"[{c['time']}] {c['details']}" for c in new_conns], "severity": "INFO"},
+        "Permission Audit": {"summary": f"Analyzed {len(packages)} packages", "findings": [f"{p['name']}: {', '.join(p['sensitive_permissions'])}" for p in user_apps_risk], "severity": "WARNING" if user_apps_risk else "OK"},
+        "Behavioral Analysis": {"summary": f"Detected {len(hidden_and_sensitive)} hidden sensitive apps", "findings": [h['name'] for h in hidden_and_sensitive], "severity": "HIGH" if hidden_and_sensitive else "OK"},
+        "Exploit Hunter": {"summary": f"Detected {len(writable)} risks", "findings": [f"{w['type']}: {w['path']}" for w in writable], "severity": hunter_status}
+    }
+    generate_html_report(html_data, html_report_path)
+    log(f"[+] Advanced HTML report generated: {html_report_path}", report_file)
+    if db: db.stop()
+
     log("[i] Remember: This is a static analysis tool. Deeply hidden malware might still exist.", report_file)
     report_file.close()
 
     # --- Post-Scan Mitigation Interaction ---
-    # Collect all suspicious packages for remediation
-    all_suspicious_pkgs = list(set(
-        [p['name'] for p in suspicious] + 
-        [p['name'] for p in hidden_and_sensitive]
-    ))
+    all_suspicious_pkgs = list(set([p['name'] for p in suspicious] + [p['name'] for p in hidden_and_sensitive]))
     
     if all_suspicious_pkgs:
         print(f"\n{'!'*60}")

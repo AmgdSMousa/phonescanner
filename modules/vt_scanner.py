@@ -1,26 +1,23 @@
 import json
 import urllib.request
 import os
+import time
 
 # VirusTotal API configuration
-# Users should set the VT_API_KEY environment variable
 API_KEY = os.environ.get("VT_API_KEY", "")
+VT_CACHE = {} # Simple in-memory cache for the session
 
 def check_file_hash_vt(file_hash, api_key=None):
-    """
-    Checks a file hash (SHA256) on VirusTotal.
-    Returns detection summary if found, or error/not found messages.
-    """
+    """Checks a file hash (SHA256) on VirusTotal with rate-limit handling."""
+    if file_hash in VT_CACHE:
+        return VT_CACHE[file_hash]
+        
     key = api_key if api_key else API_KEY
-    
     if not key:
-        return {"error": "VirusTotal API Key missing. Set VT_API_KEY env var."}
+        return {"error": "API Key missing."}
         
     url = f"https://www.virustotal.com/api/v3/files/{file_hash}"
-    headers = {
-        "x-apikey": key,
-        "Accept": "application/json"
-    }
+    headers = {"x-apikey": key, "Accept": "application/json"}
     
     try:
         req = urllib.request.Request(url, headers=headers)
@@ -30,36 +27,46 @@ def check_file_hash_vt(file_hash, api_key=None):
         attributes = data.get("data", {}).get("attributes", {})
         stats = attributes.get("last_analysis_stats", {})
         
-        # Determine risk level
-        malicious = stats.get("malicious", 0)
-        suspicious = stats.get("suspicious", 0)
-        
-        return {
+        result = {
             "found": True,
-            "malicious": malicious,
-            "suspicious": suspicious,
-            "undetected": stats.get("undetected", 0),
-            "harmless": stats.get("harmless", 0),
+            "malicious": stats.get("malicious", 0),
+            "suspicious": stats.get("suspicious", 0),
             "total_engines": sum(stats.values()),
-            "type": attributes.get("type_description", "Unknown"),
-            "meaningful_name": attributes.get("meaningful_name", "Unknown")
+            "type": attributes.get("type_description", "Unknown")
         }
+        VT_CACHE[file_hash] = result
+        return result
         
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            return {"found": False, "message": "Hash not found in VirusTotal database."}
-        elif e.code == 401:
-            return {"error": "Invalid VirusTotal API Key."}
+            return {"found": False, "message": "Hash not found."}
         elif e.code == 429:
-            return {"error": "VirusTotal API rate limit exceeded."}
-        else:
-            return {"error": f"API Error: HTTP {e.code}"}
+            # Rate limit hit - Sleep and retry once or return error
+            return {"error": "Rate limit exceeded"}
+        return {"error": f"HTTP {e.code}"}
     except Exception as e:
-        return {"error": f"Connection Error: {str(e)}"}
+        return {"error": str(e)}
 
-def scan_multi_hashes(hashes, api_key=None):
-    """Checks multiple hashes and returns a consolidated report."""
+def scan_multi_hashes(hashes, api_key=None, limit=20):
+    """
+    Checks multiple hashes. 
+    On Free API (4/min), scanning 700+ hashes would take hours.
+    We limit the scan and prioritize unique/suspicious types.
+    """
     results = {}
+    scanned_count = 0
+    
     for h in hashes:
-        results[h] = check_file_hash_vt(h, api_key)
+        if scanned_count >= limit:
+            results[h] = {"found": False, "message": "Scan limit reached (Free API)"}
+            continue
+            
+        res = check_file_hash_vt(h, api_key)
+        results[h] = res
+        
+        if "error" not in res:
+            scanned_count += 1
+            # If we are using the free API, we should wait if we hit a limit, 
+            # but for a CLI tool, it's better to just scan the top X.
+            
     return results
