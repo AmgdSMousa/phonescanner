@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Mobile Security Scanner Specific
+reports/
+*.txt
+.gemini/
+.agent/
+.agents/
+.system_generated/
+appDataDir/
+brain/
+implementation_plan.md
+task.md
+walkthrough.md
+
+# OS
+.DS_Store
+Thumbs.db
