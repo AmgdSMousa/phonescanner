@@ -4,19 +4,19 @@ A comprehensive, industry-grade security scanner for Android devices. This tool 
 
 ## Key Features
 
-- **🛡️ Interactive Dashboard**: Professional real-time TUI with live progress updates.
-- **⚔️ Active Remediation**:
+- ** Interactive Dashboard**: Professional real-time TUI with live progress updates.
+- ** Active Remediation**:
     - **Freeze/Disable**: Safely stop suspicious apps from running.
     - **Uninstall**: Remove identified threats permanently.
     - **Force Stop**: Kill malicious background processes instantly.
-- **🌍 Network Intelligence**: Geolocation and ISP identification for all active connections.
-- **📈 Vulnerability Assessment**: CVE tracking based on the device's security patch level.
-- **🔍 VirusTotal Integration**: Hash-based cloud malware scanning using 70+ AV engines.
-- **🕵️ Advanced Behavioral Analysis**:
+- ** Network Intelligence**: Geolocation and ISP identification for all active connections.
+- ** Vulnerability Assessment**: CVE tracking based on the device's security patch level.
+- ** VirusTotal Integration**: Hash-based cloud malware scanning using 70+ AV engines.
+- ** Advanced Behavioral Analysis**:
     - **Hidden App Detection**: Finds apps without launcher icons and audits their metadata.
     - **Accessibility Audit**: Flags potential spyware using accessibility services.
-- **📂 File System Audit**: Deep scan of storage for suspicious scripts, side-loaded APKs, and hidden files.
-- **⚙️ Resilient Engine**: Fully compatible with modern Android (12-16) and various OEM distributions.
+- ** File System Audit**: Deep scan of storage for suspicious scripts, side-loaded APKs, and hidden files.
+- ** Resilient Engine**: Fully compatible with modern Android (12-16) and various OEM distributions.
 
 ## How to Use
 
